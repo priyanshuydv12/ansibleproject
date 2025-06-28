@@ -1,0 +1,124 @@
+---
+- name: Deploy NGINX on EC2
+  hosts: aws
+  connection: local
+  gather_facts: false
+  collections:
+    - amazon.aws
+
+  tasks:
+    - name: Create security group
+      amazon.aws.ec2_group:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        region: "{{ region }}"
+        name: nginx-deployment-sg
+        description: Security group for NGINX deployment
+        rules:
+          - proto: tcp
+            ports: [22]
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            ports: [80]
+            cidr_ip: 0.0.0.0/0
+        state: present
+
+    - name: Launch EC2 instance
+      amazon.aws.ec2_instance:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        region: "{{ region }}"
+        key_name: "{{ key_name }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ image_id }}"
+        wait: yes
+        count: 1
+        tags:
+          Name: NGINX-Server
+        security_group: nginx-deployment-sg
+      register: ec2
+
+    - name: Wait for SSH
+      wait_for:
+        host: "{{ ec2.instances[0].public_ip_address }}"
+        port: 22
+        timeout: 600
+        delay: 30
+
+    - name: Add to inventory
+      add_host:
+        name: ec2_host
+        ansible_host: "{{ ec2.instances[0].public_ip_address }}"
+        ansible_user: ubuntu
+        ansible_ssh_private_key_file: "~/.ssh/arpit-key1.pem"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+- name: Deploy NGINX
+  hosts: ec2_host
+  become: true
+  gather_facts: true
+  collections:
+    - community.docker
+
+  tasks:
+    - name: Update system
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install packages
+      apt:
+        name: [docker.io, curl, net-tools]
+        state: present
+
+    - name: Start Docker
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Deploy web content
+      copy:
+        src: files/index.html
+        dest: /home/ubuntu/index.html
+        owner: ubuntu
+        mode: '0644'
+
+    - name: Deploy verification script
+      copy:
+        src: verify-deployment.sh
+        dest: /home/ubuntu/verify-deployment.sh
+        owner: ubuntu
+        mode: '0755'
+
+    - name: Remove existing container
+      community.docker.docker_container:
+        name: nginx
+        state: absent
+      ignore_errors: true
+
+    - name: Start NGINX container
+      community.docker.docker_container:
+        name: nginx
+        image: nginx
+        state: started
+        restart_policy: always
+        ports: ["80:80"]
+        volumes: ["/home/ubuntu/index.html:/usr/share/nginx/html/index.html"]
+
+    - name: Wait for service
+      wait_for:
+        port: 80
+        timeout: 60
+
+    - name: Verify deployment
+      shell: /home/ubuntu/verify-deployment.sh
+      register: verification_result
+
+    - name: Get public IP
+      shell: curl -s http://169.254.169.254/latest/meta-data/public-ipv4
+      register: public_ip
+
+    - name: Display access URL
+      debug:
+        msg: "Application accessible at: http://{{ public_ip.stdout }}" 
